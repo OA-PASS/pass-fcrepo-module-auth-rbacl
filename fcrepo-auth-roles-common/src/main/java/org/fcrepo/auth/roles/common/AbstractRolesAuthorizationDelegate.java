@@ -21,10 +21,12 @@ import static java.util.stream.Collectors.toSet;
 import static org.fcrepo.kernel.modeshape.FedoraSessionImpl.getJcrSession;
 
 import java.security.Principal;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import javax.inject.Inject;
 import javax.jcr.Item;
@@ -37,6 +39,7 @@ import org.fcrepo.auth.common.FedoraAuthorizationDelegate;
 import org.fcrepo.http.commons.session.SessionFactory;
 import org.fcrepo.kernel.api.FedoraSession;
 import org.fcrepo.kernel.api.exception.RepositoryRuntimeException;
+
 import org.modeshape.jcr.value.Path;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -61,6 +64,8 @@ public abstract class AbstractRolesAuthorizationDelegate implements FedoraAuthor
     @Inject
     private SessionFactory sessionFactory = null;
 
+    final ExpiringLRUCache<Session, Map<String, Boolean>> cache = new ExpiringLRUCache<>(1000, Duration.ofSeconds(30));
+
     /**
      * Gather effectives roles
      *
@@ -80,10 +85,25 @@ public abstract class AbstractRolesAuthorizationDelegate implements FedoraAuthor
     @Override
     public boolean hasPermission(final Session session, final Path absPath, final String[] actions) {
         LOGGER.debug("Does user have permission for actions: {}, on path: {}", actions, absPath);
-        final boolean permission = doHasPermission(session, absPath, actions);
 
-        LOGGER.debug("Permission for actions: {}, on: {} = {}", actions, absPath, permission);
-        return permission;
+        final Map<String, Boolean> perms = cache.getOrDo(session, () -> {
+            LOGGER.debug("Creating new cache for " + session);
+            return new ConcurrentHashMap<String, Boolean>();
+        });
+
+        Arrays.sort(actions);
+        final String key = absPath + String.join(",", actions);
+
+        if (perms.containsKey(key)) {
+            LOGGER.debug("Returning cached permission for actions: {}, on: {} = {}", actions, absPath, perms.get(key));
+            return perms.get(key);
+        } else {
+            final boolean permission = doHasPermission(session, absPath, actions);
+            perms.put(key, permission);
+            LOGGER.debug("Calculated permission for actions: {}, on: {} = {}", actions, absPath, permission);
+        }
+
+        return perms.get(key);
     }
 
     private boolean doHasPermission(final Session session, final Path absPath, final String[] actions) {

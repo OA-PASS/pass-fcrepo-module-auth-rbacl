@@ -1,0 +1,180 @@
+/*
+ * Licensed to DuraSpace under one or more contributor license agreements.
+ * See the NOTICE file distributed with this work for additional information
+ * regarding copyright ownership.
+ *
+ * DuraSpace licenses this file to you under the Apache License,
+ * Version 2.0 (the "License"); you may not use this file except in
+ * compliance with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.fcrepo.auth.roles.common;
+
+import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * A cache that holds a fixed number of items, for a fixed time.
+ * <p>
+ * When cache reaches capacity, the oldest entries are evicted. All entries are evicted after a set duration. This is
+ * helpful for temporarily caching authorizations that may be expensive to look up.
+ * </p>
+ *
+ * @author apb@jhu.edu
+ * @param <K> Key type
+ * @param <V> Value type
+ */
+@SuppressWarnings("serial")
+public class ExpiringLRUCache<K, V> {
+
+    Logger LOG = LoggerFactory.getLogger(ExpiringLRUCache.class);
+
+    ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+
+    ExecutorService runner = Executors.newCachedThreadPool();
+
+    final Duration expiry;
+
+    private final Map<K, Future<V>> cache;
+
+    private final String name;
+
+    /**
+     * Create a cache of the desired size expiration duration for entries.
+     *
+     * @param capacity Capacity of the cache;
+     * @param expiry How long each entry may live in the cache;
+     */
+    public ExpiringLRUCache(final int capacity, final Duration expiry) {
+
+        name = Thread.currentThread().getStackTrace()[2].getClassName();
+
+        cache = new LinkedHashMap<K, Future<V>>(capacity) {
+
+            @Override
+            protected boolean removeEldestEntry(final Map.Entry<K, Future<V>> eldest) {
+
+                if (size() > capacity) {
+                    LOG.info("[{}] Cache full, removing oldest entry; {}", name, eldest.getKey());
+                    return true;
+                }
+                return false;
+            }
+        };
+
+        this.expiry = expiry;
+    }
+
+    /**
+     * Get a cached value, or run the provided generator to compute a new value.
+     *
+     * @param key Retrieval key
+     * @param generator Function that MAY be executed, if there is no cached value
+     * @return The cached or generated value.
+     */
+    public V getOrDo(final K key, final Callable<V> generator) {
+        return getOrDo(key, generator, false);
+    }
+
+    /**
+     * Call a generator to populate the cache, regardless of whether there is already a cached value or not.
+     *
+     * @param key The key
+     * @param generator Generator function
+     * @return The generated value
+     */
+    public V doAndCache(final K key, final Callable<V> generator) {
+        return getOrDo(key, generator, true);
+    }
+
+    private V getOrDo(final K key, final Callable<V> generator, final boolean forceGenerate) {
+
+        final Future<V> result;
+        boolean cached = true;
+        synchronized (cache) {
+
+            if (cache.containsKey(key) && !forceGenerate) {
+                result = cache.get(key);
+                cached = true;
+            } else {
+                cached = false;
+                result = runner.submit(() -> {
+                    final V value = generator.call();
+                    LOG.debug("[{}] Calculated value for {} as {}", name, key, value);
+                    return value;
+                });
+                cache.put(key, result);
+                scheduler.schedule(() -> {
+                    LOG.info("[{}] Expiring cached value for {}", name, key);
+                    remove(key);
+                }, expiry.toMillis(), TimeUnit.MILLISECONDS);
+            }
+        }
+
+        final V value = doGet(result);
+        if (value == null) {
+            LOG.info("[{}] Value for key {} is null, refusing to cache it", name, key);
+            remove(key);
+        } else {
+            if (cached) {
+                LOG.debug("[{}] Returning cached value for {}: {}", name, key, value);
+            } else {
+                LOG.debug("[{}] Return calculated value for {}: {}", name, key, value);
+            }
+        }
+        return value;
+    }
+
+    private void remove(final K key) {
+        synchronized (cache) {
+            cache.remove(key);
+        }
+    }
+
+    /**
+     * Get a cached value, or null if not present in cache.
+     *
+     * @param key Cache key.
+     * @return The cached value
+     */
+    public V get(final K key) {
+        synchronized (cache) {
+            return Optional.ofNullable(cache.get(key)).map(ExpiringLRUCache::doGet).orElse(null);
+        }
+    }
+
+    private static <V> V doGet(final Future<V> value) {
+        try {
+            return value.get();
+        } catch (final ExecutionException e) {
+            if (e.getCause() instanceof RuntimeException) {
+                throw (RuntimeException) e.getCause();
+            } else {
+                throw new RuntimeException(e.getCause());
+            }
+        } catch (final InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Read from cache was interrupted");
+        }
+    }
+}
